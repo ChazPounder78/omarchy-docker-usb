@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.chazpounder78.docker-usb",
+  "name": "Docker USB Passthrough",
+  "version": "1.0.0",
+  "author": "ChazPounder78",
+  "license": "MIT",
+  "description": "Pick which USB devices a Docker container gets. A bar panel lists connected USB devices with checkboxes, remembers your choices, and applies them by recreating the target container with exactly the checked --device flags. No --privileged, no all-or-nothing.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Docker USB",
+    "description": "Check and uncheck USB devices passed into a Docker container.",
+    "category": "System",
+    "aliases": ["usb", "docker", "docker-usb", "passthrough"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

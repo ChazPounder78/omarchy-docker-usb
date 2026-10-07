@@ -1,0 +1,510 @@
+#!/bin/bash
+# docker-usb helper: list USB devices, remember selections, recreate a
+# docker container with exactly the checked devices attached.
+
+set -uo pipefail
+
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# State lives OUTSIDE the plugin directory: the shell hot-reloads a plugin
+# whenever any file in its folder changes, so writing state.json here would
+# loop forever. Also keeps the git checkout clean of runtime data.
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/docker-usb"
+STATE_FILE="$STATE_DIR/state.json"
+UDEV_RULES_DIR="/etc/udev/rules.d"
+
+state_init() {
+  mkdir -p "$STATE_DIR"
+  local want tmp
+  want='{"target":"","devices":{}}'
+  if [[ -f $STATE_FILE ]] && jq -e . "$STATE_FILE" >/dev/null 2>&1; then
+    tmp=$(jq -c '(.target // "") as $t | (.devices // {}) as $d | {target: $t, devices: $d}' \
+      "$STATE_FILE") || tmp="$want"
+  else
+    tmp="$want"
+  fi
+  # only touch the file when the content actually changed
+  if [[ ! -f $STATE_FILE ]] || [[ $(cat "$STATE_FILE") != "$tmp" ]]; then
+    printf '%s\n' "$tmp" > "$STATE_FILE"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# USB enumeration (sysfs)
+# ---------------------------------------------------------------------------
+
+# Prints the /dev/bus/usb/BBB/DDD path for a vid:pid, empty if unplugged.
+find_bus_path() {
+  local want_v="$1" want_p="$2" d v p bus dev
+  for d in /sys/bus/usb/devices/*; do
+    [[ -f $d/idVendor && -f $d/busnum && -f $d/devnum ]] || continue
+    [[ $(basename "$d") == *:* ]] && continue
+    v=$(<"$d/idVendor") p=$(<"$d/idProduct")
+    [[ $v == "$want_v" && $p == "$want_p" ]] || continue
+    bus=$(<"$d/busnum") dev=$(<"$d/devnum")
+    printf '/dev/bus/usb/%03d/%03d' "$bus" "$dev"
+    return 0
+  done
+  return 0
+}
+
+# Human label for a vid:pid currently attached.
+find_label() {
+  local want_v="$1" want_p="$2" d v p prod mfr
+  for d in /sys/bus/usb/devices/*; do
+    [[ -f $d/idVendor && -f $d/busnum && -f $d/devnum ]] || continue
+    [[ $(basename "$d") == *:* ]] && continue
+    v=$(<"$d/idVendor") p=$(<"$d/idProduct")
+    [[ $v == "$want_v" && $p == "$want_p" ]] || continue
+    prod=$(cat "$d/product" 2>/dev/null || true)
+    mfr=$(cat "$d/manufacturer" 2>/dev/null || true)
+    if [[ -n ${prod:-} ]]; then
+      printf '%s' "$prod"
+    elif [[ -n ${mfr:-} ]]; then
+      printf '%s %s:%s' "$mfr" "$want_v" "$want_p"
+    else
+      printf '%s:%s' "$want_v" "$want_p"
+    fi
+    return 0
+  done
+  return 0
+}
+
+# JSON array of every real (non-hub, non-root-hub) attached USB device.
+connected_devices_json() {
+  local d name cls vid pid prod mfr label bus dev path
+  local -a lines=()
+  for d in /sys/bus/usb/devices/*; do
+    name=$(basename "$d")
+    [[ $name == *:* ]] && continue          # interface nodes
+    [[ $name == usb* ]] && continue         # root hubs
+    [[ -f $d/idVendor && -f $d/idProduct && -f $d/busnum && -f $d/devnum ]] || continue
+    cls=$(cat "$d/bDeviceClass" 2>/dev/null || true)
+    [[ $cls == "09" ]] && continue          # hubs
+    vid=$(<"$d/idVendor")
+    pid=$(<"$d/idProduct")
+    prod=$(cat "$d/product" 2>/dev/null || true)
+    mfr=$(cat "$d/manufacturer" 2>/dev/null || true)
+    if [[ -n ${prod:-} ]]; then
+      label=$prod
+    elif [[ -n ${mfr:-} ]]; then
+      label="$mfr $vid:$pid"
+    else
+      label="$vid:$pid"
+    fi
+    bus=$(<"$d/busnum") dev=$(<"$d/devnum")
+    path=$(printf '/dev/bus/usb/%03d/%03d' "$bus" "$dev")
+    lines+=("$(jq -c -n \
+      --arg vid "$vid" --arg pid "$pid" --arg name "$label" --arg path "$path" \
+      '{vid: $vid, pid: $pid, name: $name, path: $path, connected: true}')")
+  done
+  if ((${#lines[@]})); then
+    printf '%s\n' "${lines[@]}" | jq -sc .
+  else
+    printf '[]'
+  fi
+}
+
+# Merge attached devices with remembered state: attach checked flags, then
+# append remembered-but-unplugged devices that are still checked.
+devices_json() {
+  state_init
+  local conn state
+  conn=$(connected_devices_json)
+  state=$(jq -c . "$STATE_FILE")
+  jq -c -n --argjson conn "$conn" --argjson st "$state" '
+    ($st.devices // {}) as $sd |
+    ($conn | map(. + {
+      key: (.vid + ":" + .pid),
+      checked: (($sd[.vid + ":" + .pid].checked) // false)
+    })) as $live |
+    ($sd | to_entries
+      | map(select(.value.checked == true))
+      | map(select(.key as $k | ($live | any(.key == $k)) | not))
+      | map(.key | split(":") | select(length == 2)
+          | . as $ids
+          | {
+              vid: $ids[0],
+              pid: $ids[1],
+              name: ($sd[($ids[0] + ":" + $ids[1])].name // ($ids[0] + ":" + $ids[1])),
+              path: "",
+              connected: false,
+              checked: true,
+              key: ($ids[0] + ":" + $ids[1])
+            })
+    ) as $missing |
+    ($live + $missing | map(del(.key)))
+  '
+}
+
+# ---------------------------------------------------------------------------
+# Docker
+# ---------------------------------------------------------------------------
+
+containers_json() {
+  local out
+  if out=$(docker ps -a --format '{{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null); then
+    printf '%s\n' "$out" | jq -R -c -s '
+      split("\n") | map(select(length > 0) | split("\t") |
+      {name: .[0], image: (.[1] // ""), status: (.[2] // "")})'
+  else
+    printf '[]'
+  fi
+}
+
+status_json() {
+  state_init
+  local devices containers target
+  devices=$(devices_json)
+  containers=$(containers_json)
+  target=$(jq -r '.target // ""' "$STATE_FILE")
+  jq -c -n --argjson devices "$devices" --argjson containers "$containers" --arg target "$target" \
+    '{target: $target, containers: $containers, devices: $devices}'
+}
+
+# ---------------------------------------------------------------------------
+# udev: stable /dev/usb-<vid>-<pid> symlinks
+# ---------------------------------------------------------------------------
+
+udev_rule_text() {
+  printf 'SUBSYSTEM=="usb", ATTR{idVendor}=="%s", ATTR{idProduct}=="%s", SYMLINK+="usb-%s-%s", MODE="0666"\n' \
+    "$1" "$2" "$1" "$2"
+}
+
+# Returns 0 if the stable symlink exists after this call.
+ensure_stable_symlink() {
+  local vid="$1" pid="$2"
+  local link="/dev/usb-$vid-$pid"
+  [[ -e $link ]] && return 0
+
+  local rulename="90-docker-usb-$vid-$pid.rules"
+  local rulefile="$UDEV_RULES_DIR/$rulename"
+  local want have
+  want=$(udev_rule_text "$vid" "$pid")
+
+  if [[ -f $rulefile ]]; then
+    have=$(cat "$rulefile" 2>/dev/null || true)
+    if [[ "$have" == "$want" ]]; then
+      # rule already installed - just trigger it again
+      pkexec sh -c 'udevadm control --reload && udevadm trigger -c add -s usb && udevadm settle' \
+        >/dev/null 2>&1 || true
+      _wait_for_link "$link"
+      [[ -e $link ]] && return 0
+      return 1
+    fi
+  fi
+
+  # One pkexec prompt installs the rule and reloads udev.
+  local tmp
+  tmp=$(mktemp) || return 1
+  printf '%s' "$want" > "$tmp"
+  if pkexec sh -c '
+      install -m 0644 "$1" "$2" &&
+      udevadm control --reload &&
+      udevadm trigger -c add -s usb &&
+      udevadm settle
+    ' sh "$tmp" "$rulefile" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    _wait_for_link "$link"
+    [[ -e $link ]] && return 0
+    return 1
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+_wait_for_link() {
+  local link="$1" i
+  for i in $(seq 1 20); do
+    [[ -e $link ]] && return 0
+    sleep 0.25
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# apply: recreate the target container with the checked devices
+# ---------------------------------------------------------------------------
+
+fail_apply() {
+  local msg="$1"
+  jq -c -n --arg m "$msg" '{ok: false, message: $m, warnings: [], devices: []}'
+  exit 0
+}
+
+cmd_apply() {
+  state_init
+
+  local target
+  target=$(jq -r '.target // ""' "$STATE_FILE")
+  [[ -n $target ]] || fail_apply "No target container selected yet."
+
+  command -v docker >/dev/null 2>&1 || fail_apply "docker is not installed."
+
+  local inspect
+  inspect=$(docker inspect "$target" 2>/dev/null) || \
+    fail_apply "Container '$target' not found. Refresh the container list."
+
+  local -a warnings=()
+  if jq -e '.[0].Config.Labels["com.docker.compose.project"] // empty' \
+      >/dev/null 2>&1 <<<"$inspect"; then
+    warnings+=("'$target' is docker-compose managed — after any 'compose up', re-run Apply here.")
+  fi
+  if jq -e '.[0].HostConfig.DeviceRequests // [] | length > 0' \
+      >/dev/null 2>&1 <<<"$inspect"; then
+    warnings+=("GPU/extra device requests on '$target' are not preserved.")
+  fi
+
+  # ---- resolve checked devices
+  local -a checked_keys=()
+  while IFS= read -r k; do
+    [[ -n $k ]] && checked_keys+=("$k")
+  done < <(jq -r '(.devices // {}) | to_entries[] | select(.value.checked == true) | .key' "$STATE_FILE")
+
+  local -a dev_flags=()
+  local -a resolved=()
+  local key vid pid bus_path label
+  for key in "${checked_keys[@]}"; do
+    vid=${key%%:*}
+    pid=${key##*:}
+    bus_path=$(find_bus_path "$vid" "$pid")
+    if [[ -z $bus_path ]]; then
+      warnings+=("Remembered device $key is not connected — skipped.")
+      continue
+    fi
+    if ensure_stable_symlink "$vid" "$pid"; then
+      dev_flags+=(--device "/dev/usb-$vid-$pid")
+      resolved+=("/dev/usb-$vid-$pid")
+    else
+      dev_flags+=(--device "$bus_path")
+      resolved+=("$bus_path")
+      warnings+=("Could not install udev rule for $key (password declined?) — using $bus_path; may not survive a reboot.")
+    fi
+  done
+
+  # ---- reconstruct the container
+  local -a base_args=()
+  local b64
+  while IFS= read -r b64; do
+    [[ -n $b64 ]] || continue
+    base_args+=("$(printf '%s' "$b64" | base64 -d)")
+  done < <(jq -r '.[0] | [
+      (["--name", (.Name | ltrimstr("/"))]),
+      (if .Config.Tty == true then ["-t"] else [] end),
+      (if .Config.OpenStdin == true then ["-i"] else [] end),
+      (if .HostConfig.Privileged == true then ["--privileged"] else [] end),
+      (if .HostConfig.AutoRemove == true then ["--rm"] else [] end),
+      (if .HostConfig.Init == true then ["--init"] else [] end),
+      (if .HostConfig.PublishAllPorts == true then ["-P"] else [] end),
+      ((.HostConfig.RestartPolicy.Name // "") as $n |
+        if ($n != "" and $n != "no") then
+          ["--restart", (if $n == "on-failure" and ((.HostConfig.RestartPolicy.MaximumRetryCount // 0) > 0)
+            then "on-failure:" + (.HostConfig.RestartPolicy.MaximumRetryCount | tostring) else $n end)]
+        else [] end),
+((.HostConfig.PortBindings // {}) | to_entries
+        | map(.key as $cp | (.value // []) | map([
+            "-p",
+            (((.HostIp // "") | if . == "" then "" else . + ":" end) +
+             ((.HostPort // "") | if . == "" then "" else . + ":" end) + $cp)
+          ]))
+        | add | add // []),
+      ((.Config.Env // []) | map(["-e", .]) | add // []),
+      ((.Mounts // []) | map(
+        if .Type == "bind" then ["-v", .Source + ":" + .Destination + (if .RW == false then ":ro" else "" end)]
+        elif .Type == "volume" then ["-v", .Name + ":" + .Destination + (if .RW == false then ":ro" else "" end)]
+        elif .Type == "tmpfs" then ["--tmpfs", .Destination]
+        else [] end) | add // []),
+      ((.HostConfig.NetworkMode // "") as $m |
+        if ($m != "" and $m != "default") then ["--network", $m] else [] end),
+      ((.HostConfig.Dns // []) | map(["--dns", tostring]) | add // []),
+      ((.HostConfig.DnsSearch // []) | map(["--dns-search", .]) | add // []),
+      ((.HostConfig.DnsOptions // []) | map(["--dns-option", .]) | add // []),
+      ((.HostConfig.ExtraHosts // []) | map(["--add-host", .]) | add // []),
+      ((.HostConfig.CapAdd // []) | map(["--cap-add", .]) | add // []),
+      ((.HostConfig.CapDrop // []) | map(["--cap-drop", .]) | add // []),
+      ((.HostConfig.SecurityOpt // []) | map(["--security-opt", .]) | add // []),
+      ((.HostConfig.DeviceCgroupRules // []) | map(["--device-cgroup-rule", .]) | add // []),
+      ((.HostConfig.GroupAdd // []) | map(["--group-add", .]) | add // []),
+      ((.HostConfig.VolumesFrom // []) | map(["--volumes-from", .]) | add // []),
+      ((.HostConfig.Sysctls // {}) | to_entries
+        | map(["--sysctl", .key + "=" + (.value | tostring)]) | add // []),
+      ((.HostConfig.Ulimits // []) | map(
+        ["--ulimit", .Type + ":" + (.Soft | tostring) + ":" + (.Hard | tostring)]) | add // []),
+      ((.HostConfig.Tmpfs // {}) | to_entries
+        | map(["--tmpfs", .key + ":" + (.value | tostring)]) | add // []),
+      ((.HostConfig.IpcMode // "") as $m |
+        if ($m != "" and $m != "private") then ["--ipc", $m] else [] end),
+      ((.HostConfig.PidMode // "") as $m |
+        if ($m != "" and $m != "private") then ["--pid", $m] else [] end),
+      ((.HostConfig.UTSMode // "") as $m |
+        if ($m != "" and $m != "private") then ["--uts", $m] else [] end),
+      (if .HostConfig.ReadonlyRootfs == true then ["--read-only"] else [] end),
+      (if (.HostConfig.ShmSize // 0) > 0 then ["--shm-size", (.HostConfig.ShmSize | tostring)] else [] end),
+      (if (.HostConfig.NanoCpus // 0) > 0 then ["--nano-cpus", (.HostConfig.NanoCpus | tostring)] else [] end),
+      (if (.HostConfig.CpuShares // 0) > 0 then ["--cpu-shares", (.HostConfig.CpuShares | tostring)] else [] end),
+      (if (.HostConfig.CpusetCpus // "") != "" then ["--cpuset-cpus", .HostConfig.CpusetCpus] else [] end),
+      (if (.HostConfig.Memory // 0) != 0 then ["--memory", (.HostConfig.Memory | tostring)] else [] end),
+      (if (.HostConfig.MemorySwap // 0) != 0 then ["--memory-swap", (.HostConfig.MemorySwap | tostring)] else [] end),
+      (if (.HostConfig.PidsLimit // 0) != 0 then ["--pids-limit", (.HostConfig.PidsLimit | tostring)] else [] end),
+      (if (.HostConfig.BlkioWeight // 0) > 0 then ["--blkio-weight", (.HostConfig.BlkioWeight | tostring)] else [] end),
+      (if (.HostConfig.OomKillDisable // false) == true then ["--oom-kill-disable"] else [] end),
+      (if (.HostConfig.LogConfig.Type // "") != ""
+       then (["--log-driver", .HostConfig.LogConfig.Type]
+             + ((.HostConfig.LogConfig.Config // {}) | to_entries
+                | map(["--log-opt", .key + "=" + (.value | tostring)]) | add // []))
+       else [] end),
+      (if (.Config.StopSignal // "") != "" then ["--stop-signal", .Config.StopSignal] else [] end),
+      (if (.Config.StopTimeout // 0) > 0 then ["--stop-timeout", (.Config.StopTimeout | tostring)] else [] end),
+      (if .Config.Healthcheck != null and ((.Config.Healthcheck.Test // ["NONE"])[0] != "NONE")
+       then (["--health-cmd",
+              (if .Config.Healthcheck.Test[0] == "CMD-SHELL" then (.Config.Healthcheck.Test[1] // "")
+               elif .Config.Healthcheck.Test[0] == "CMD"
+               then (.Config.Healthcheck.Test[1:] | join(" "))
+               else "" end)])
+            + (if (.Config.Healthcheck.Interval // 0) != 0 and (.Config.Healthcheck.Interval | type) == "number"
+               then ["--health-interval", ((.Config.Healthcheck.Interval / 1000000000 | tostring) + "s")] else [] end)
+            + (if (.Config.Healthcheck.Timeout // 0) != 0 and (.Config.Healthcheck.Timeout | type) == "number"
+               then ["--health-timeout", ((.Config.Healthcheck.Timeout / 1000000000 | tostring) + "s")] else [] end)
+            + (if (.Config.Healthcheck.StartPeriod // 0) != 0 and (.Config.Healthcheck.StartPeriod | type) == "number"
+               then ["--health-start-period", ((.Config.Healthcheck.StartPeriod / 1000000000 | tostring) + "s")] else [] end)
+            + (if (.Config.Healthcheck.Retries // 0) > 0
+               then ["--health-retries", (.Config.Healthcheck.Retries | tostring)] else [] end)
+       else [] end),
+      (if (.Config.User // "") != "" then ["--user", .Config.User] else [] end),
+      (if (.Config.WorkingDir // "") != "" then ["-w", .Config.WorkingDir] else [] end),
+      (if (.Config.MacAddress // "") != "" then ["--mac-address", .Config.MacAddress] else [] end),
+      (if (.Config.Hostname // "") != "" then ["--hostname", .Config.Hostname] else [] end),
+      (if (.Config.Domainname // "") != "" then ["--domainname", .Config.Domainname] else [] end),
+      ((.Config.Labels // {}) | to_entries | map(["--label", .key + "=" + (.value | tostring)]) | add // []),
+      (["-d", .Config.Image]),
+      (if (.Config.Entrypoint // []) | length == 0 then []
+       elif (.Config.Entrypoint | length) == 1 then [.Config.Entrypoint[0]]
+       else [.Config.Entrypoint[0]] + (.Config.Entrypoint[1:]) end),
+      ((.Config.Cmd // []) | map(tostring))
+    ] | add | .[] | @base64' <<<"$inspect")
+
+  local was_running
+  was_running=$(jq -r '.[0].State.Running // false' <<<"$inspect")
+
+  local primary_net extra_net
+  primary_net=$(jq -r '.[0].HostConfig.NetworkMode // ""' <<<"$inspect")
+
+  # ---- swap: rename old aside (and stop it, releasing published ports),
+  # ----      run new, drop the old on success
+  local bak="$target-usbbak-$$"
+  docker rm -f "$bak" >/dev/null 2>&1 || true
+  if ! docker rename "$target" "$bak" 2>/dev/null; then
+    fail_apply "Could not rename '$target' (is Docker running?)."
+  fi
+  docker stop "$bak" >/dev/null 2>&1 || true
+
+  local out rc=0
+  out=$(docker run "${dev_flags[@]}" "${base_args[@]}" 2>&1) || rc=$?
+  if (( rc != 0 )); then
+    docker rm -f "$target" >/dev/null 2>&1 || true
+    docker rename "$bak" "$target" >/dev/null 2>&1 || true
+    if [[ $was_running == "true" ]]; then
+      docker start "$target" >/dev/null 2>&1 || true
+    fi
+    fail_apply "docker run failed: $(printf '%s' "$out" | tail -c 400)"
+  fi
+  docker rm -f "$bak" >/dev/null 2>&1 || true
+
+  # preserve originally-stopped state
+  if [[ $was_running != "true" ]]; then
+    docker stop "$target" >/dev/null 2>&1 || true
+    warnings+=("'$target' was stopped before — left stopped.")
+  fi
+
+  # re-attach any additional networks docker run did not cover
+  local net
+  while IFS= read -r net; do
+    [[ -z $net ]] && continue
+    if [[ -n $primary_net && $primary_net != "default" && $primary_net != "bridge" ]]; then
+      [[ $net == "$primary_net" ]] && continue
+    else
+      [[ $net == "bridge" ]] && continue
+    fi
+    docker network connect "$net" "$target" >/dev/null 2>&1 || \
+      warnings+=("Could not re-connect network '$net'.")
+  done < <(jq -r '.[0].NetworkSettings.Networks // {} | keys[]' <<<"$inspect")
+
+  local n=${#resolved[@]}
+  local msg joined=""
+  if (( n > 0 )); then
+    for r in "${resolved[@]}"; do joined+="${joined:+, }$r"; done
+    msg="Recreated '$target' with $n USB device(s): $joined"
+  else
+    msg="Recreated '$target' with no USB devices passed through."
+  fi
+
+  local wjson='[]' djson='[]'
+  if ((${#warnings[@]})); then
+    wjson=$(printf '%s\n' "${warnings[@]}" | jq -R -s 'split("\n") | map(select(length > 0))')
+  fi
+  if ((${#resolved[@]})); then
+    djson=$(printf '%s\n' "${resolved[@]}" | jq -R -s 'split("\n") | map(select(length > 0))')
+  fi
+
+  jq -c -n \
+    --arg m "$msg" \
+    --argjson w "$wjson" \
+    --argjson d "$djson" \
+    '{ok: true, message: $m, warnings: $w, devices: $d}'
+}
+
+# ---------------------------------------------------------------------------
+# subcommands
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat >&2 <<'EOF'
+usage: docker-usb <status|list|containers|state|target|check|apply> [args]
+  status                       full JSON state for the panel
+  list                         connected + remembered devices as JSON
+  containers                   docker containers as JSON
+  state                        raw state file
+  target <name>                set the target container ("" to clear)
+  check <vid> <pid> <on|off> [name]   remember a checkbox
+  apply                        recreate target with the checked devices
+EOF
+  exit 1
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    status)     status_json ;;
+    list)       devices_json ;;
+    containers) containers_json ;;
+    state)      state_init; jq -c . "$STATE_FILE" ;;
+    target)
+      state_init
+      if [[ $# -lt 2 ]]; then
+        jq -c -r '.target // ""' "$STATE_FILE"
+      else
+        local tmp
+        tmp=$(jq -c --arg t "$2" '.target = $t' "$STATE_FILE") || exit 1
+        printf '%s\n' "$tmp" > "$STATE_FILE"
+      fi
+      ;;
+    check)
+      state_init
+      [[ $# -ge 4 ]] || usage
+      local vid="$2" pid="$3" on="$4" name="${5:-}" tmp
+      local json_on=false
+      [[ $on == "on" ]] && json_on=true
+      [[ $on == "off" ]] && json_on=false
+      tmp=$(jq -c \
+        --arg k "$vid:$pid" --argjson c "$json_on" --arg n "$name" \
+        '.devices = ((.devices // {}) | .[$k] =
+           ((.[$k] // {}) + {checked: $c}
+             + (if $n != "" then {name: $n} else {} end)))' \
+        "$STATE_FILE") || exit 1
+      printf '%s\n' "$tmp" > "$STATE_FILE"
+      ;;
+    apply) cmd_apply ;;
+    *) usage ;;
+  esac
+}
+
+main "$@"

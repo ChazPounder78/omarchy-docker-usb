@@ -1,0 +1,3 @@
+# runtime state is kept in XDG state, not here — but never commit it if present
+state.json
+*.log
